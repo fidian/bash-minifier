@@ -1,0 +1,500 @@
+#! /usr/bin/env bash
+
+# shellcheck disable=SC1091
+. bpm
+bpm::include assign
+
+bash-tokenizer::token() {
+    echo "$1@$2:$3 $4"
+}
+
+# Faster and more specialized than string::trim
+bash-tokenizer::trim() {
+    local str tab
+
+    str=$2
+    tab=$'\t'
+
+    if $3; then
+        while [[ "$str" == " "* ]] || [[ "$str" == "$tab"* ]]; do
+            str=${str# }
+            str=${str#$tab}
+        done
+    fi
+
+    if $4; then
+        while [[ "$str" == *" " ]] || [[ "$str" == *"$tab" ]]; do
+            str=${str% }
+            str=${str%$tab}
+        done
+    fi
+
+    local "$1" && assign::value "$1" "$str"
+}
+
+bash-tokenizer::getWord() {
+    local c keepReading pos word
+
+    c=${2:0:1}
+    pos=0
+
+    case "$c" in
+        '"')
+            # Double quoted string
+            word=$c
+            pos=1
+            c=${2:pos:1}
+
+            while [[ "$c" != "" ]] && [[ "$c" != '"' ]]; do
+                word+=$c
+
+                if [[ "$c" == "\\" ]]; then
+                    pos=$((pos + 1))
+                    word+=${2:pos:1}
+                fi
+
+                pos=$((pos + 1))
+                c=${2:pos:1}
+            done
+
+            word+=$c
+            ;;
+
+        "'")
+            # Single quoted string
+            word=${2:1}
+            word=${word%%\'}
+            word="'$word'"
+            ;;
+
+        *)
+            # Something else
+            keepReading=true
+            pos=0
+            word=
+
+            while $keepReading; do
+                c=${2:pos:1}
+
+                case "$c" in
+                    "\\")
+                        word+=${2:pos:2}
+                        pos=$((pos + 2))
+                        ;;
+
+                    ""|'"'|"'"|' '|'('|')'|'['|']'|'$'|'{'|'}'|'<'|'>'|'%')
+                        keepReading=false
+                        ;;
+
+                    *)
+                        word+=$c
+                        pos=$((pos + 1))
+                        ;;
+                esac
+            done
+            ;;
+    esac
+
+    local "$1" && assign::value "$1" "$word"
+}
+
+bash-tokenizer::splitByLine() {
+    local content cr crlf lf line lines
+
+    cr=$'\r'
+    crlf=$'\r\n'
+    lf=$'\n'
+    content=${2//$crlf/$lf}
+    content=${2//$cr/$lf}
+    
+    # Add a fake line here so we can track by $lineNumber later
+    lines=("")
+
+    while [[ -n "$content" ]]; do
+        if [[ "$content" == *"$lf"* ]]; then
+            line=${content%%$lf*}
+            content=${content#*$lf}
+        else
+            line=$content
+            content=
+        fi
+
+        lines[${#lines[@]}]=$line
+    done
+
+    local "$1" && assign::array "$1" ${lines[@]+"${lines[@]}"}
+}
+
+bash-tokenizer::tokenize() {
+    local atBeginningOfCommand charNumber chunk len line lineNumber lines nextIsAtBeginning tokenType
+
+    bash-tokenizer::splitByLine lines "$1"
+    lineNumber=1
+    charNumber=1
+    atBeginningOfCommand=true
+
+    if [[ ${lines[lineNumber]:0:2} == '#!' ]]; then
+        # Shebang - remove spaces between file magic and command
+        # SHEBANG omits "#!"
+        chunk=${lines[lineNumber]:2}
+        bash-tokenizer::trim chunk "$chunk" true true
+        bash-tokenizer::token SHEBANG "$lineNumber" 1 "$chunk"
+        lineNumber=$((lineNumber + 1))
+    fi
+
+    while [[ "$lineNumber" -lt "${#lines[@]}" ]]; do
+        line=${lines[lineNumber]}
+
+        while [[ "$line" != '' ]]; do
+            chunk=$line
+            bash-tokenizer::trim line "$chunk" true false
+            charNumber=$((charNumber + ${#chunk} - ${#line}))
+            tokenType=
+            nextIsAtBeginning=false
+
+            if $atBeginningOfCommand; then
+                # Arrange conditions by reverse ASCII value
+                case "$line" in
+                    "while"[[:space:]]*)
+                        chunk="while"
+                        tokenType=KW_WHILE
+                        ;;
+                    
+                    "until"[[:space:]]*)
+                        chunk="until"
+                        tokenType=KW_UNTIL
+                        ;;
+                    
+                    "time"[[:space:]]*)
+                        chunk="time"
+                        tokenType=KW_TIME
+                        ;;
+                    
+                    "then"[[:space:]]*)
+                        chunk="then"
+                        tokenType=KW_THEN
+                        ;;
+                    
+                    "select"[[:space:]]*)
+                        chunk="select"
+                        tokenType=KW_SELECT
+                        ;;
+                    
+                    "if"[[:space:]]*)
+                        chunk="if"
+                        tokenType=KW_IF
+                        ;;
+                    
+                    "function"[[:space:]]*)
+                        chunk="function"
+                        tokenType=KW_FUNCTION
+                        ;;
+                    
+                    "for"[[:space:]]*)
+                        chunk="for"
+                        tokenType=KW_FOR
+                        ;;
+                    
+                    "fi"[[:space:]]*)
+                        chunk="fi"
+                        tokenType=KW_FI
+                        ;;
+                    
+                    "esac"[[:space:]]*)
+                        chunk="esac"
+                        tokenType=KW_ESAC
+                        ;;
+                    
+                    "else"[[:space:]]*)
+                        chunk="else"
+                        tokenType=KW_ELSE
+                        ;;
+                    
+                    "elif"[[:space:]]*)
+                        chunk="elif"
+                        tokenType=KW_ELIF
+                        ;;
+                    
+                    "done"[[:space:]]*)
+                        chunk="done"
+                        tokenType=KW_DONE
+                        ;;
+                    
+                    "do"[[:space:]]*)
+                        chunk="do"
+                        tokenType=KW_DO
+                        ;;
+                    
+                    "case"[[:space:]]*)
+                        chunk="case"
+                        tokenType=KW_CASE
+                        ;;
+                    
+                    "[["*)
+                        chunk="[["
+                        tokenType=COND_START
+                        ;;
+                esac
+
+                if [[ -z "$tokenType" ]] && [[ "$line" == +([[:word:]])=* ]]; then
+                    chunk=${line%%=*}=
+
+                    if [[ "$line" == +([[:word:]])=[[:space:]] ]] || [[ "$line" == +([[:word:]])= ]]; then
+                        tokenType=ASSIGNMENT_EMPTY
+                    else
+                        tokenType=ASSIGNMENT
+                    fi
+                fi
+                    
+                if [[ -n "$tokenType" ]]; then
+                    nextIsAtBeginning=true
+                fi
+            fi
+
+            # Careful - arrange longer matches above shorter matches
+            if [[ -z "$tokenType" ]]; then
+                # set | grep ^line=
+                # if [[ "$line" == "\$"* ]]; then
+                #     echo "Match"
+                # fi
+                case "$line" in
+                    "#"*)
+                        chunk=$line
+                        tokenType=COMMENT
+                        ;;
+
+
+                    ";;&"*)
+                        chunk=";;&"
+                        tokenType=SEMI_SEMI_AND
+                        ;;
+
+                    ";;"*)
+                        chunk=";;"
+                        tokenType=SEMI_SEMI
+                        nextIsAtBeginning=true
+                        ;;
+
+                    ";&"*)
+                        chunk=";&"
+                        tokenType=SEMI_AND
+                        ;;
+
+                    ";"*)
+                        chunk=";"
+                        tokenType=SEMICOLON
+                        nextIsAtBeginning=true
+                        ;;
+
+
+                    "<<-"*)
+                        chunk="<<-"
+                        tokenType=LESS_LESS_MINUS
+                        ;;
+
+                    "<<<"*)
+                        chunk="<<-"
+                        tokenType=LESS_LESS_LESS
+                        ;;
+
+                    "<<"*)
+                        chunk="<<"
+                        tokenType=LESS_LESS
+                        ;;
+
+                    "<>"*)
+                        chunk="<>"
+                        tokenType=LESS_GREATER
+                        ;;
+
+                    "<("*)
+                        chunk="<("
+                        tokenType=LESS_PAREN
+                        ;;
+
+                    "<&"*)
+                        chunk="<&"
+                        tokenType=LESS_AND
+                        ;;
+
+                    "<"*)
+                        chunk="<"
+                        tokenType=LESS_THAN
+                        ;;
+
+
+                    ">>"*)
+                        chunk=">>"
+                        tokenType=GREATER_GREATER
+                        ;;
+
+                    ">&"*)
+                        chunk=">&"
+                        tokenType=GREATER_AND
+                        ;;
+
+                    ">|"*)
+                        chunk=">|"
+                        tokenType=GREATER_BAR
+                        ;;
+
+                    ">"*)
+                        chunk=">"
+                        tokenType=GREATER_THAN
+                        ;;
+
+
+                    "&>>"*)
+                        chunk="&>"
+                        tokenType=AND_GREATER_GREATER
+                        ;;
+
+                    "&&"*)
+                        chunk="&&"
+                        tokenType=AND_AND
+                        nextIsAtBeginning=true
+                        ;;
+
+                    "&>"*)
+                        chunk="&>"
+                        tokenType=AND_GREATER
+                        ;;
+
+                    "&"*)
+                        chunk="&"
+                        tokenType=AND
+                        ;;
+
+
+                    "||"*)
+                        chunk="||"
+                        tokenType=OR_OR
+                        nextIsAtBeginning=true
+                        ;;
+
+                    "|&"*)
+                        chunk="|&"
+                        tokenType=BAR_AND
+                        ;;
+
+                    "|"*)
+                        chunk="|"
+                        tokenType=PIPE
+                        nextIsAtBeginning=true
+                        ;;
+
+
+                    "\$(("*)
+                        chunk="\$(("
+                        tokenType=VARIABLE_PAREN_PAREN
+                        ;;
+
+                    "\$("*)
+                        chunk="\$("
+                        tokenType=VARIABLE_PAREN
+                        ;;
+
+                    "\${"*)
+                        chunk="\${"
+                        tokenType=VARIABLE_BRACE
+
+                        if [[ "$line" == "\${"*([[:space:]])"#"* ]]; then
+                            chunk=${line%#*}"#"
+                            tokenType=VARIABLE_BRACE_LENGTH
+                        fi
+                        ;;
+
+                    "\$"*)
+                        bash-tokenizer::getWord chunk "${line:1}"
+                        chunk="\$$chunk"
+                        tokenType=VARIABLE
+                        ;;
+
+
+                    "]]"*)
+                        chunk="]]"
+                        tokenType=COND_END
+                        ;;
+
+                    "]"*)
+                        chunk="]"
+                        tokenType=BRACKET_CLOSE
+                        ;;
+
+
+                    "("*)
+                        chunk="("
+                        tokenType=PAREN_OPEN
+                        ;;
+
+                    ")"*)
+                        chunk=")"
+                        tokenType=PAREN_CLOSE
+                        ;;
+
+                    "{"*)
+                        chunk="{"
+                        tokenType=BRACE_OPEN
+                        ;;
+
+                    "}"*)
+                        chunk="}"
+                        tokenType=BRACE_CLOSE
+                        ;;
+
+                    "["*)
+                        chunk="["
+                        tokenType=BRACKET_OPEN
+                        ;;
+
+                    "!"*)
+                        chunk="!"
+                        tokenType=BANG
+                        nextIsAtBeginning=true
+                        ;;
+
+                    "%"*)
+                        chunk="%"
+                        tokenType=PERCENT
+                        ;;
+
+                    "'"*)
+                        bash-tokenizer::getWord chunk "$line"
+                        tokenType=SINGLE_QUOTE_STRING
+                        ;;
+
+                    '"'*)
+                        bash-tokenizer::getWord chunk "$line"
+                        tokenType=DOUBLE_QUOTE_STRING
+                        ;;
+
+                    *)
+                        bash-tokenizer::getWord chunk "$line"
+                        tokenType=WORD
+                
+                        if [[ -z "$chunk" ]]; then
+                            chunk=${line:0:1}
+                            tokenType=UNKNOWN
+                        fi
+                        ;;
+                esac
+            fi
+
+            bash-tokenizer::token "$tokenType" "$lineNumber" "$charNumber" "$chunk"
+            len=${#chunk}
+            charNumber=$((charNumber + len))
+            line=${line:len}
+
+            atBeginningOfCommand=$nextIsAtBeginning
+        done
+
+        # Done with this line. If the line continued witha backslash at the end
+        # or with a heredoc, those portions have been consumed already as well.
+        bash-tokenizer::token EOL "$lineNumber" "$charNumber" ""
+        lineNumber=$((lineNumber + 1))
+        charNumber=1
+        atBeginningOfCommand=true
+    done
+
+    bash-tokenizer::token EOF "$lineNumber" 1 ""
+}
