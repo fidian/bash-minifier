@@ -1,0 +1,264 @@
+#! /usr/bin/env bash
+
+# shellcheck disable=SC1091
+. bpm
+bpm::include assign
+bpm::include strict
+
+bash-minifier::help() {
+    cat <<'EOF'
+Bash Minifier
+
+Parses a shell script and writes a minified version to stdout.
+
+Usage:
+
+    bash-minifier INPUT_FILE > OUTPUT_FILE
+EOF
+}
+
+bash-minifier::load() {
+    local content=()
+
+    while IFS=$'\n' read -r line; do
+        content[${#content[@]}]=$line
+    done < <(cat -- "$2")
+
+    local "$1" && assign::array "$1" "${content[@]}"
+}
+
+bash-minifier::token() {
+    local "$1" && assign::value "$1" "$2@$3:$4 $5"
+}
+
+bash-minifier::trim() {
+    local str tab
+
+    str=$2
+    tab=$'\t'
+
+    while [[ "$str" == " "* ]] || [[ "$str" == "$tab"* ]]; do
+        str=${str# }
+        str=${str#$tab}
+    done
+
+    local "$1" && assign::value "$1" "$str"
+}
+
+bash-minifier::trimBoth() {
+    local str tab
+
+    str=$2
+    tab=$'\t'
+
+    while [[ "$str" == " "* ]] || [[ "$str" == "$tab"* ]]; do
+        str=${str# }
+        str=${str#$tab}
+    done
+
+    while [[ "$str" == *" " ]] || [[ "$str" == *"$tab" ]]; do
+        str=${str% }
+        str=${str%$tab}
+    done
+
+    local "$1" && assign::value "$1" "$str"
+}
+
+bash-minifier::getWord() {
+    local c keepReading pos word
+
+    c=${2:0:1}
+    pos=0
+
+    case "$c" in
+        '"')
+            # Double quoted string
+            word=$c
+            pos=1
+            c=${2:pos:1}
+
+            while [[ "$c" != "" ]] && [[ "$c" != '"' ]]; do
+                word+=$c
+
+                if [[ "$c" == "\\" ]]; then
+                    pos=$((pos + 1))
+                    word+=${2:pos:1}
+                fi
+
+                pos=$((pos + 1))
+                c=${2:pos:1}
+            done
+
+            word+=$c
+            ;;
+
+        "'")
+            # Single quoted string
+            word=${2:1}
+            word=${word%%\'}
+            word="'$word'"
+            ;;
+
+        " " | "")
+            # No word at current position
+            word=
+            ;;
+
+        *)
+            # Something else
+            keepReading=true
+            pos=0
+            word=
+
+            while $keepReading; do
+                c=${2:pos:1}
+
+                case "$c" in
+                    "\\")
+                        word+=${2:pos:2}
+                        pos=$((pos + 2))
+                        ;;
+
+                    "" | '"' | "'" | ' ' | '(' | ')' | '[' | ']' | '$' | '{' | '}')
+                        keepReading=false
+                        ;;
+
+                    *)
+                        word+=$c
+                        pos=$((pos + 1))
+                        ;;
+                esac
+            done
+            ;;
+    esac
+
+    local "$1" && assign::value "$1" "$word"
+}
+
+bash-minifier::tokenize() {
+    local atBeginningOfCommand charNumber chunk len line lineNumber target token tokens word
+
+    target=$1
+    shift
+    lineNumber=1
+    charNumber=1
+    tokens=()
+    atBeginningOfCommand=true
+
+    if [[ ${1:0:2} == '#!' ]]; then
+        # Shebang - remove spaces between file magic and command
+        # SHEBANG omits "#!"
+        chunk=${1:2}
+        bash-minifier::trimBoth chunk "$chunk"
+        bash-minifier::token token SHEBANG "$lineNumber" 1 "$chunk"
+        tokens[${#tokens[@]}]=$token
+        shift
+        lineNumber=$((lineNumber + 1))
+    fi
+
+    while [[ $# != 0 ]]; do
+        line=$1
+
+        while [[ "$line" != '' ]]; do
+            chunk=$line
+            bash-minifier::trim line "$chunk"
+            charNumber=$((charNumber + ${#chunk} - ${#line}))
+
+            if [[ "$line" == '#'* ]]; then
+                # Comment
+                bash-minifier::token token COMMENT "$lineNumber" "$charNumber" "$line"
+                tokens[${#tokens[@]}]=$token
+                charNumber=$((charNumber + ${#line}))
+                line=
+            elif $atBeginningOfCommand && [[ "$line" == +([[:word:]])=* ]]; then
+                # Assignment
+                chunk=${line%%=*}=
+                len=${#chunk}
+                bash-minifier::token token ASSIGNMENT "$lineNumber" "$charNumber" "$chunk"
+                tokens[${#tokens[@]}]=$token
+                line=${line:len}
+            elif [[ "$line" == function+([[:space:]])+([[:word:]])*([[:space:]])"("*([[:space:]])")"* ]] || \
+                [[ "$line" == function+([[:space:]])+([[:word:]])* ]] || \
+                [[ "$line" == +([[:word:]])*([[:space:]])"("*([[:space:]])")"* ]]; then
+                # Remove "function" and space
+                if [[ "$line" == function* ]]; then
+                    line=${line:9}
+                fi
+
+                # Trim leading whitespace
+                chunk=$line
+                bash-minifier::trim line "$chunk"
+                charNumber=$((charNumber + ${#chunk} - ${#line}))
+
+                # Get function name and add it as a token
+                chunk=${line%%(*}
+                chunk=${chunk%%\{*}
+                bash-minifier::trimBoth chunk "$chunk"
+                bash-minifier::token token FUNCTION "$lineNumber" "$charNumber" "$chunk"
+                tokens[${#tokens[@]}]=$token
+                charNumber=$((charNumber + ${#chunk}))
+
+                # Trim any whitespace after the function name
+                chunk=${line:${#chunk}}
+                bash-minifier::trim line "$chunk"
+                charNumber=$((charNumber + ${#chunk} - ${#line}))
+            elif [[ "$line" == '$'* ]]; then
+                bash-minifier::getWord chunk "${line:1}"
+                chunk="\$$chunk"
+                len=${#chunk}
+                bash-minifier::token token VARIABLE "$lineNumber" "$charNumber" "$chunk"
+                tokens[${#tokens[@]}]=$token
+                charNumber=$((charNumber + len))
+                line=${line:len}
+            else
+                bash-minifier::getWord word "$line"
+                # Preserve all other content
+                bash-minifier::token token LINE "$lineNumber" "$charNumber" "$line"
+                tokens[${#tokens[@]}]=$token
+                charNumber=$((charNumber + ${#chunk}))
+                line=
+            fi
+        done
+
+        # Done with this line. If the line continued witha backslash at the end
+        # or with a heredoc, those portions have been consumed already as well.
+        shift
+        bash-minifier::token token EOL "$lineNumber" "$charNumber" ""
+        tokens[${#tokens[@]}]=$token
+        lineNumber=$((lineNumber + 1))
+        charNumber=1
+        atBeginningOfCommand=true
+    done
+
+    bash-minifier::token token EOF "$lineNumber" 1 ""
+    tokens[${#tokens[@]}]=$token
+
+    local "$target" && assign::array "$target" ${tokens[@]+"${tokens[@]}"}
+}
+
+bash-minifier() {
+    local content filename token
+  
+    strict::mode
+    filename=${1-}
+
+    if [[ -z "$filename" ]] || [[ ! -f "$filename" ]]; then
+        bash-minifier::help
+
+        exit 1
+    fi
+
+    bash-minifier::load content "$filename"
+    bash-minifier::tokenize content "${content[@]}"
+
+    for token in "${content[@]}"; do
+        echo "$token"
+    done
+}
+
+if ! bpm::isSourced; then
+    bash-minifier ${@+"$@"}
+else
+    "quotes"
+    'apostrophes'
+fi
