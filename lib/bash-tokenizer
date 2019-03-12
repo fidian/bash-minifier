@@ -538,7 +538,7 @@ bash-tokenizer::tokenize() {
         fi
     done
 
-    if [[ -n "$DEBUG" ]]; then
+    if [[ -n "${DEBUG-}" ]]; then
         if [[ "${#BASH_TOKENIZER__CONTEXT[@]}" != 1 ]]; then
             echo "WARNING: Terminating without cleaning context" >&2
             echo "${BASH_TOKENIZER__CONTEXT[@]}" >&2
