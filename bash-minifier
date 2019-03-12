@@ -50,7 +50,7 @@ bash-minifier() {
 
     content=$(cat -- "$filename"; echo x)
     content=${content%x}
-    bash-tokenizer::tokenize "$content"
+    bash-tokenizer::tokenize content "$content"
 }
 
 if ! bpm::isSourced; then

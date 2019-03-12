@@ -5,496 +5,548 @@
 bpm::include assign
 
 bash-tokenizer::token() {
-    echo "$1@$2:$3 $4"
-}
+    local chunk cr noNewlines token
 
-# Faster and more specialized than string::trim
-bash-tokenizer::trim() {
-    local str tab
+    token=$1
+    chunk=$2
+    cr=$'\n'
+    BASH_TOKENIZER__TOKENS[${#BASH_TOKENIZER__TOKENS[@]}]="$token@$BASH_TOKENIZER__LINE:$BASH_TOKENIZER__CHAR $chunk"
 
-    str=$2
-    tab=$'\t'
-
-    if $3; then
-        while [[ "$str" == " "* ]] || [[ "$str" == "$tab"* ]]; do
-            str=${str# }
-            str=${str#$tab}
-        done
+    if [[ -n "${DEBUG-}" ]]; then
+        printf "%-16s%-25s%4s:%-3s  %q\\n" "$token" "${BASH_TOKENIZER__CONTEXT[0]}" "$BASH_TOKENIZER__LINE" "$BASH_TOKENIZER__CHAR" "$chunk" >&2
     fi
 
-    if $4; then
-        while [[ "$str" == *" " ]] || [[ "$str" == *"$tab" ]]; do
-            str=${str% }
-            str=${str%$tab}
-        done
-    fi
+    ((BASH_TOKENIZER__POS+=${#chunk}))
+    noNewlines=${chunk//$cr}
 
-    local "$1" && assign::value "$1" "$str"
+    if [[ "${#noNewlines}" != "${#chunk}" ]]; then
+        ((BASH_TOKENIZER__LINE+=${#chunk}-${#noNewlines}))
+        chunk=${chunk##$cr}
+        ((BASH_TOKENIZER__CHAR=1+${#chunk}))
+    else
+        ((BASH_TOKENIZER__CHAR+=${#chunk}))
+    fi
 }
 
-bash-tokenizer::getWord() {
-    local c keepReading pos word
+bash-tokenizer::shebang() {
+    local chunk
 
-    c=${2:0:1}
+    if [[ ${BASH_TOKENIZER__CONTENT:0:2} == "#!" ]]; then
+        chunk="${BASH_TOKENIZER__CONTENT%%$cr*}$cr"
+        bash-tokenizer::token SHEBANG "$chunk"
+    fi
+}
+
+bash-tokenizer::comment() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+    bash-tokenizer::token COMMENT "$line"
+}
+
+bash-tokenizer::word() {
+    local pos word
+
     pos=0
 
-    case "$c" in
-        '"')
-            # Double quoted string
-            word=$c
-            pos=1
-            c=${2:pos:1}
+    while true; do
+        case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}" in
+            "" | $'\n' | " " | $'\t' | '(' | ')' | '{' | '}' | '[' | ']' | '$' | '"' | "'" | "|" | "%")
+                word="${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos}"
 
-            while [[ "$c" != "" ]] && [[ "$c" != '"' ]]; do
-                word+=$c
+                if ! bash-tokenizer::contextFlagExists VAR && [[ "$word" == *% ]]; then
+                    # Include this as part of the word if not parsing a variable
+                    ((pos+=1))
+                elif [[ -n "$word" ]]; then
+                    bash-tokenizer::token WORD "$word"
 
-                if [[ "$c" == "\\" ]]; then
-                    pos=$((pos + 1))
-                    word+=${2:pos:1}
+                    return
+                else
+                    bash-tokenizer::token UNKNOWN "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}"
+
+                    return
                 fi
+                ;;
 
-                pos=$((pos + 1))
-                c=${2:pos:1}
-            done
+            *)
+                ((pos+=1))
+                ;;
+        esac
+    done
+}
 
-            word+=$c
+bash-tokenizer::ws() {
+    local pos
+
+    pos=0
+
+    while true; do
+        case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}" in
+            " " | $'\t')
+                ((pos+=1))
+                ;;
+
+            *)
+                bash-tokenizer::token WS "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos}"
+                return
+                ;;
+        esac
+    done
+}
+
+bash-tokenizer::parenOpen() {
+    local chunk cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        '('*)
+            if [[ "$line" == '('*([[:space:]])')'* ]]; then
+                chunk=${line%%)*}
+                bash-tokenizer::token EMPTY_LIST "$chunk)"
+            else
+                bash-tokenizer::token PAREN_OPEN '('
+                bash-tokenizer::contextPush SUBSHELL
+            fi
+            ;;
+    esac
+}
+
+bash-tokenizer::parenClose() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        ')'*)
+            bash-tokenizer::token PAREN_CLOSE ')'
+            bash-tokenizer::contextPop
+            ;;
+    esac
+}
+
+bash-tokenizer::braceOpen() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        '{'*)
+            bash-tokenizer::token BRACE_OPEN '{'
+            bash-tokenizer::contextPush BLOCK
+            ;;
+    esac
+}
+
+bash-tokenizer::braceClose() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        '}'*)
+            bash-tokenizer::token BRACE_CLOSE '}'
+            bash-tokenizer::contextPop
+            ;;
+    esac
+}
+
+bash-tokenizer::bracketOpen() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        '[['*)
+            bash-tokenizer::token D_BRACKET_OPEN '[['
+            bash-tokenizer::contextPush D_BRACKET
             ;;
 
-        "'")
-            # Single quoted string
-            word=${2:1}
-            word=${word%%\'}
-            word="'$word'"
+        '['*)
+            bash-tokenizer::token BRACKET_OPEN '['
+            bash-tokenizer::contextPush BRACKET
+            ;;
+    esac
+}
+
+bash-tokenizer::bracketClose() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        ']]'*)
+            bash-tokenizer::token D_BRACKET_CLOSE '[['
+            bash-tokenizer::contextPop
+            ;;
+
+        ']'*)
+            bash-tokenizer::token BRACKET_CLOSE ']'
+            bash-tokenizer::contextPop
+            ;;
+    esac
+}
+
+bash-tokenizer::lessThan() {
+    local cr line
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        "<<"*)
+            bash-tokenizer::token REDIR_HEREDOC '<<'
+            bash-tokenizer::contextFlagAdd DOC
+            ;;
+
+        "<("*)
+            bash-tokenizer::token REDIR_SUBSHELL '<('
+            bash-tokenizer::contextPush SUBSHELL
+            ;;
+
+        '<'*)
+            bash-tokenizer::token LT "<"
+            ;;
+    esac
+}
+
+bash-tokenizer::greaterThan() {
+    # Need to work on this
+    bash-tokenizer::token GT '>'
+}
+
+bash-tokenizer::heredocContent() {
+    local content cr delim line tokenNum token
+
+    tokenNum=${#BASH_TOKENIZER__TOKENS[@]}
+    token=
+    cr=$'\n'
+
+    while [[ "$token" != REDIR_HEREDOC@* ]]; do
+        ((tokenNum-=1))
+        token=${BASH_TOKENIZER__TOKENS[tokenNum]}
+    done
+
+    # FIXME - This should consume all word-like tokens so delimiters like EOF''
+    # and "a"b'c'$'d' all work.
+    # FIXME - This doesn't handle <<- syntax.
+    ((tokenNum+=1))
+    token=${BASH_TOKENIZER__TOKENS[tokenNum]}
+    delim=${token#* }
+    delim=${delim//"'"}
+    delim=${delim//'"'}
+    content=
+    line=
+
+    while [[ "$line" != "$delim$cr" ]]; do
+        content+=$line
+        line=${BASH_TOKENIZER__CONTENT:$BASH_TOKENIZER__POS + ${#content}}
+        line="${line%%$cr*}$cr"
+    done
+
+    content+=$line
+    bash-tokenizer::token HEREDOC "$content"
+    bash-tokenizer::contextFlagRemove DOC
+}
+
+bash-tokenizer::ansiEscape() {
+    local char pos
+
+    pos=2
+
+    while true; do
+        char=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}
+
+        case "$char" in
+            "'" | "")
+                bash-tokenizer::token ANSI_ESCAPE "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos + 1}"
+
+                return
+                ;;
+
+            "\\")
+                ((pos+=2))
+                ;;
+
+            *)
+                ((pos+=1))
+                ;;
+        esac
+    done
+}
+
+bash-tokenizer::stringFragment() {
+    local len
+
+    len=0
+
+    while true; do
+        case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + len:1}" in
+            '"' | "\$" )
+                if [[ "$len" != 0 ]]; then
+                    bash-tokenizer::token STR_FRAGMENT "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:len}"
+                fi
+
+                return
+                ;;
+
+            "\\")
+                ((len+=2))
+                ;;
+
+            *)
+                ((len+=1))
+                ;;
+        esac
+    done
+}
+
+bash-tokenizer::stringStart() {
+    bash-tokenizer::token STR_START '"'
+    bash-tokenizer::contextFlagAdd STR
+}
+
+bash-tokenizer::stringEnd() {
+    bash-tokenizer::token STR_END '"'
+    bash-tokenizer::contextFlagRemove STR
+}
+
+bash-tokenizer::variable() {
+    local cr line pos
+
+    cr=$'\n'
+    line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
+    line=${line%%$cr*}
+
+    case "$line" in
+        "\$("*)
+            bash-tokenizer::token VAR_SUBSHELL "\$("
+            bash-tokenizer::contextPush SUBSHELL
+            bash-tokenizer::contextFlagAdd VAR
+            ;;
+
+        "\${#"* | "\${!"*)
+            bash-tokenizer::token VAR_BRACE "${line:0:3}"
+            bash-tokenizer::contextPush BLOCK
+            bash-tokenizer::contextFlagAdd VAR
+            ;;
+
+        "\${"*)
+            bash-tokenizer::token VAR_BRACE "\${"
+            bash-tokenizer::contextPush BLOCK
+            bash-tokenizer::contextFlagAdd VAR
+            ;;
+
+        "\$'"*)
+            bash-tokenizer::ansiEscape
+            ;;
+
+        "\$"*)
+            pos=1
+
+            while true; do
+                case "${line:pos:1}" in
+                    [[:word:]] | @ | "!")
+                        ((pos+=1))
+                        ;;
+
+                    *)
+                        bash-tokenizer::token VAR "${line:0:pos}"
+
+                        return
+                        ;;
+                esac
+            done
+
+            ;;
+    esac
+}
+
+bash-tokenizer::stringLiteral() {
+    local content
+
+    content=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + 1}
+    content=${content%%"'"*}
+    bash-tokenizer::token STR_LITERAL "'$content'"
+}
+
+bash-tokenizer::contextPop() {
+    local oldIfs
+
+    oldIfs=$IFS
+    IFS=$'\n' # Needed for array slicing before Bash 4.0-rc1
+    BASH_TOKENIZER__CONTEXT=("${BASH_TOKENIZER__CONTEXT[@]:1}")
+    IFS=$oldIfs
+}
+
+bash-tokenizer::contextPush() {
+    BASH_TOKENIZER__CONTEXT=("$1." ${BASH_TOKENIZER__CONTEXT[@]+"${BASH_TOKENIZER__CONTEXT[@]}"})
+}
+
+bash-tokenizer::contextFlagAdd() {
+    BASH_TOKENIZER__CONTEXT[0]="${BASH_TOKENIZER__CONTEXT[0]//.$1./.}$1."
+}
+
+bash-tokenizer::contextFlagRemove() {
+    BASH_TOKENIZER__CONTEXT[0]="${BASH_TOKENIZER__CONTEXT[0]//.$1./.}"
+}
+
+bash-tokenizer::contextFlagExists() {
+    [[ "${BASH_TOKENIZER__CONTEXT[0]}" == *."$1".* ]]
+}
+
+bash-tokenizer::percent() {
+    if bash-tokenizer::contextFlagExists VAR; then
+        bash-tokenizer::token PERCENT %
+    else
+        bash-tokenizer::commandDefault
+    fi
+}
+
+bash-tokenizer::commandDefault() {
+    bash-tokenizer::word
+    bash-tokenizer::contextFlagAdd ARG
+}
+
+bash-tokenizer::tokenizeString() {
+    case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:1}" in
+        '"')
+            bash-tokenizer::stringEnd
+            ;;
+
+        "\$")
+            bash-tokenizer::variable
             ;;
 
         *)
-            # Something else
-            keepReading=true
-            pos=0
-            word=
-
-            while $keepReading; do
-                c=${2:pos:1}
-
-                case "$c" in
-                    "\\")
-                        word+=${2:pos:2}
-                        pos=$((pos + 2))
-                        ;;
-
-                    ""|'"'|"'"|' '|'('|')'|'['|']'|'$'|'{'|'}'|'<'|'>'|'%')
-                        keepReading=false
-                        ;;
-
-                    *)
-                        word+=$c
-                        pos=$((pos + 1))
-                        ;;
-                esac
-            done
+            bash-tokenizer::stringFragment
             ;;
     esac
-
-    local "$1" && assign::value "$1" "$word"
 }
 
-bash-tokenizer::splitByLine() {
-    local content cr crlf lf line lines
+bash-tokenizer::tokenizeCommand() {
+    local char
 
-    cr=$'\r'
-    crlf=$'\r\n'
-    lf=$'\n'
-    content=${2//$crlf/$lf}
-    content=${2//$cr/$lf}
-    
-    # Add a fake line here so we can track by $lineNumber later
-    lines=("")
+    char=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:1}
 
-    while [[ -n "$content" ]]; do
-        if [[ "$content" == *"$lf"* ]]; then
-            line=${content%%$lf*}
-            content=${content#*$lf}
-        else
-            line=$content
-            content=
-        fi
+    case "$char" in
+        "" | $'\n')
+            bash-tokenizer::token EOL "$cr"
+            bash-tokenizer::contextFlagRemove ARG
 
-        lines[${#lines[@]}]=$line
-    done
+            if bash-tokenizer::contextFlagExists DOC; then
+                bash-tokenizer::heredocContent
+            fi
+            ;;
 
-    local "$1" && assign::array "$1" ${lines[@]+"${lines[@]}"}
+        '(')
+            bash-tokenizer::parenOpen
+            ;;
+
+        ')')
+            bash-tokenizer::parenClose
+            ;;
+
+        '{')
+            bash-tokenizer::braceOpen
+            ;;
+
+        '}')
+            bash-tokenizer::braceClose
+            ;;
+
+        '[')
+            bash-tokenizer::bracketOpen
+            ;;
+
+        ']')
+            bash-tokenizer::bracketClose
+            ;;
+
+        '<')
+            bash-tokenizer::lessThan
+            ;;
+
+        '>')
+            bash-tokenizer::greaterThan
+            ;;
+
+        "#")
+            bash-tokenizer::comment
+            ;;
+
+        " " | $'\t')
+            bash-tokenizer::ws
+            ;;
+
+        "\$")
+            bash-tokenizer::variable
+            ;;
+
+        "'")
+            bash-tokenizer::stringLiteral
+            ;;
+
+        '"')
+            bash-tokenizer::stringStart
+            ;;
+
+        '%')
+            bash-tokenizer::percent
+            ;;
+
+        *)
+            bash-tokenizer::commandDefault
+            ;;
+    esac
 }
 
 bash-tokenizer::tokenize() {
-    local atBeginningOfCommand charNumber chunk len line lineNumber lines nextIsAtBeginning tokenType
+    local cr
 
-    bash-tokenizer::splitByLine lines "$1"
-    lineNumber=1
-    charNumber=1
-    atBeginningOfCommand=true
+    BASH_TOKENIZER__CONTENT=$2
+    BASH_TOKENIZER__LINE=1
+    BASH_TOKENIZER__CHAR=1
+    BASH_TOKENIZER__POS=0
+    BASH_TOKENIZER__CONTEXT=()
+    BASH_TOKENIZER__TOKENS=()
+    cr=$'\n'
 
-    if [[ ${lines[lineNumber]:0:2} == '#!' ]]; then
-        # Shebang - remove spaces between file magic and command
-        # SHEBANG omits "#!"
-        chunk=${lines[lineNumber]:2}
-        bash-tokenizer::trim chunk "$chunk" true true
-        bash-tokenizer::token SHEBANG "$lineNumber" 1 "$chunk"
-        lineNumber=$((lineNumber + 1))
-    fi
+    bash-tokenizer::contextPush SOURCE
+    bash-tokenizer::shebang
 
-    while [[ "$lineNumber" -lt "${#lines[@]}" ]]; do
-        line=${lines[lineNumber]}
-
-        while [[ "$line" != '' ]]; do
-            chunk=$line
-            bash-tokenizer::trim line "$chunk" true false
-            charNumber=$((charNumber + ${#chunk} - ${#line}))
-            tokenType=
-            nextIsAtBeginning=false
-
-            if $atBeginningOfCommand; then
-                # Arrange conditions by reverse ASCII value
-                case "$line" in
-                    "while"[[:space:]]*)
-                        chunk="while"
-                        tokenType=KW_WHILE
-                        ;;
-                    
-                    "until"[[:space:]]*)
-                        chunk="until"
-                        tokenType=KW_UNTIL
-                        ;;
-                    
-                    "time"[[:space:]]*)
-                        chunk="time"
-                        tokenType=KW_TIME
-                        ;;
-                    
-                    "then"[[:space:]]*)
-                        chunk="then"
-                        tokenType=KW_THEN
-                        ;;
-                    
-                    "select"[[:space:]]*)
-                        chunk="select"
-                        tokenType=KW_SELECT
-                        ;;
-                    
-                    "if"[[:space:]]*)
-                        chunk="if"
-                        tokenType=KW_IF
-                        ;;
-                    
-                    "function"[[:space:]]*)
-                        chunk="function"
-                        tokenType=KW_FUNCTION
-                        ;;
-                    
-                    "for"[[:space:]]*)
-                        chunk="for"
-                        tokenType=KW_FOR
-                        ;;
-                    
-                    "fi"[[:space:]]*)
-                        chunk="fi"
-                        tokenType=KW_FI
-                        ;;
-                    
-                    "esac"[[:space:]]*)
-                        chunk="esac"
-                        tokenType=KW_ESAC
-                        ;;
-                    
-                    "else"[[:space:]]*)
-                        chunk="else"
-                        tokenType=KW_ELSE
-                        ;;
-                    
-                    "elif"[[:space:]]*)
-                        chunk="elif"
-                        tokenType=KW_ELIF
-                        ;;
-                    
-                    "done"[[:space:]]*)
-                        chunk="done"
-                        tokenType=KW_DONE
-                        ;;
-                    
-                    "do"[[:space:]]*)
-                        chunk="do"
-                        tokenType=KW_DO
-                        ;;
-                    
-                    "case"[[:space:]]*)
-                        chunk="case"
-                        tokenType=KW_CASE
-                        ;;
-                    
-                    "[["*)
-                        chunk="[["
-                        tokenType=COND_START
-                        ;;
-                esac
-
-                if [[ -z "$tokenType" ]] && [[ "$line" == +([[:word:]])=* ]]; then
-                    chunk=${line%%=*}=
-
-                    if [[ "$line" == +([[:word:]])=[[:space:]] ]] || [[ "$line" == +([[:word:]])= ]]; then
-                        tokenType=ASSIGNMENT_EMPTY
-                    else
-                        tokenType=ASSIGNMENT
-                    fi
-                fi
-                    
-                if [[ -n "$tokenType" ]]; then
-                    nextIsAtBeginning=true
-                fi
-            fi
-
-            # Careful - arrange longer matches above shorter matches
-            if [[ -z "$tokenType" ]]; then
-                # set | grep ^line=
-                # if [[ "$line" == "\$"* ]]; then
-                #     echo "Match"
-                # fi
-                case "$line" in
-                    "#"*)
-                        chunk=$line
-                        tokenType=COMMENT
-                        ;;
-
-
-                    ";;&"*)
-                        chunk=";;&"
-                        tokenType=SEMI_SEMI_AND
-                        ;;
-
-                    ";;"*)
-                        chunk=";;"
-                        tokenType=SEMI_SEMI
-                        nextIsAtBeginning=true
-                        ;;
-
-                    ";&"*)
-                        chunk=";&"
-                        tokenType=SEMI_AND
-                        ;;
-
-                    ";"*)
-                        chunk=";"
-                        tokenType=SEMICOLON
-                        nextIsAtBeginning=true
-                        ;;
-
-
-                    "<<-"*)
-                        chunk="<<-"
-                        tokenType=LESS_LESS_MINUS
-                        ;;
-
-                    "<<<"*)
-                        chunk="<<-"
-                        tokenType=LESS_LESS_LESS
-                        ;;
-
-                    "<<"*)
-                        chunk="<<"
-                        tokenType=LESS_LESS
-                        ;;
-
-                    "<>"*)
-                        chunk="<>"
-                        tokenType=LESS_GREATER
-                        ;;
-
-                    "<("*)
-                        chunk="<("
-                        tokenType=LESS_PAREN
-                        ;;
-
-                    "<&"*)
-                        chunk="<&"
-                        tokenType=LESS_AND
-                        ;;
-
-                    "<"*)
-                        chunk="<"
-                        tokenType=LESS_THAN
-                        ;;
-
-
-                    ">>"*)
-                        chunk=">>"
-                        tokenType=GREATER_GREATER
-                        ;;
-
-                    ">&"*)
-                        chunk=">&"
-                        tokenType=GREATER_AND
-                        ;;
-
-                    ">|"*)
-                        chunk=">|"
-                        tokenType=GREATER_BAR
-                        ;;
-
-                    ">"*)
-                        chunk=">"
-                        tokenType=GREATER_THAN
-                        ;;
-
-
-                    "&>>"*)
-                        chunk="&>"
-                        tokenType=AND_GREATER_GREATER
-                        ;;
-
-                    "&&"*)
-                        chunk="&&"
-                        tokenType=AND_AND
-                        nextIsAtBeginning=true
-                        ;;
-
-                    "&>"*)
-                        chunk="&>"
-                        tokenType=AND_GREATER
-                        ;;
-
-                    "&"*)
-                        chunk="&"
-                        tokenType=AND
-                        ;;
-
-
-                    "||"*)
-                        chunk="||"
-                        tokenType=OR_OR
-                        nextIsAtBeginning=true
-                        ;;
-
-                    "|&"*)
-                        chunk="|&"
-                        tokenType=BAR_AND
-                        ;;
-
-                    "|"*)
-                        chunk="|"
-                        tokenType=PIPE
-                        nextIsAtBeginning=true
-                        ;;
-
-
-                    "\$(("*)
-                        chunk="\$(("
-                        tokenType=VARIABLE_PAREN_PAREN
-                        ;;
-
-                    "\$("*)
-                        chunk="\$("
-                        tokenType=VARIABLE_PAREN
-                        ;;
-
-                    "\${"*)
-                        chunk="\${"
-                        tokenType=VARIABLE_BRACE
-
-                        if [[ "$line" == "\${"*([[:space:]])"#"* ]]; then
-                            chunk=${line%#*}"#"
-                            tokenType=VARIABLE_BRACE_LENGTH
-                        fi
-                        ;;
-
-                    "\$"*)
-                        bash-tokenizer::getWord chunk "${line:1}"
-                        chunk="\$$chunk"
-                        tokenType=VARIABLE
-                        ;;
-
-
-                    "]]"*)
-                        chunk="]]"
-                        tokenType=COND_END
-                        ;;
-
-                    "]"*)
-                        chunk="]"
-                        tokenType=BRACKET_CLOSE
-                        ;;
-
-
-                    "("*)
-                        chunk="("
-                        tokenType=PAREN_OPEN
-                        ;;
-
-                    ")"*)
-                        chunk=")"
-                        tokenType=PAREN_CLOSE
-                        ;;
-
-                    "{"*)
-                        chunk="{"
-                        tokenType=BRACE_OPEN
-                        ;;
-
-                    "}"*)
-                        chunk="}"
-                        tokenType=BRACE_CLOSE
-                        ;;
-
-                    "["*)
-                        chunk="["
-                        tokenType=BRACKET_OPEN
-                        ;;
-
-                    "!"*)
-                        chunk="!"
-                        tokenType=BANG
-                        nextIsAtBeginning=true
-                        ;;
-
-                    "%"*)
-                        chunk="%"
-                        tokenType=PERCENT
-                        ;;
-
-                    "'"*)
-                        bash-tokenizer::getWord chunk "$line"
-                        tokenType=SINGLE_QUOTE_STRING
-                        ;;
-
-                    '"'*)
-                        bash-tokenizer::getWord chunk "$line"
-                        tokenType=DOUBLE_QUOTE_STRING
-                        ;;
-
-                    *)
-                        bash-tokenizer::getWord chunk "$line"
-                        tokenType=WORD
-                
-                        if [[ -z "$chunk" ]]; then
-                            chunk=${line:0:1}
-                            tokenType=UNKNOWN
-                        fi
-                        ;;
-                esac
-            fi
-
-            bash-tokenizer::token "$tokenType" "$lineNumber" "$charNumber" "$chunk"
-            len=${#chunk}
-            charNumber=$((charNumber + len))
-            line=${line:len}
-
-            atBeginningOfCommand=$nextIsAtBeginning
-        done
-
-        # Done with this line. If the line continued witha backslash at the end
-        # or with a heredoc, those portions have been consumed already as well.
-        bash-tokenizer::token EOL "$lineNumber" "$charNumber" ""
-        lineNumber=$((lineNumber + 1))
-        charNumber=1
-        atBeginningOfCommand=true
+    while [[ "$BASH_TOKENIZER__POS" -lt "${#BASH_TOKENIZER__CONTENT}" ]]; do
+        if bash-tokenizer::contextFlagExists STR; then
+            bash-tokenizer::tokenizeString
+        else
+            bash-tokenizer::tokenizeCommand
+        fi
     done
 
-    bash-tokenizer::token EOF "$lineNumber" 1 ""
+    if [[ -n "$DEBUG" ]]; then
+        if [[ "${#BASH_TOKENIZER__CONTEXT[@]}" != 1 ]]; then
+            echo "WARNING: Terminating without cleaning context" >&2
+            echo "${BASH_TOKENIZER__CONTEXT[@]}" >&2
+        elif [[ "${BASH_TOKENIZER__CONTEXT[0]}" != SOURCE.* ]]; then
+            echo "WARNING: Invalid terminating context" >&2
+            echo "${BASH_TOKENIZER__CONTEXT[@]}" >&2
+        fi
+    fi
+
+    local "$1" && assign::array "$1" ${BASH_TOKENIZER__TOKENS[@]+"${BASH_TOKENIZER__TOKENS[@]}"}
 }
