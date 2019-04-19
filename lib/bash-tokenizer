@@ -5,11 +5,10 @@
 bpm::include assign
 
 bash-tokenizer::token() {
-    local chunk cr noNewlines token
+    local chunk noNewlines token
 
     token=$1
     chunk=$2
-    cr=$'\n'
     BASH_TOKENIZER__TOKENS[${#BASH_TOKENIZER__TOKENS[@]}]="$token@$BASH_TOKENIZER__LINE:$BASH_TOKENIZER__CHAR $chunk"
 
     if [[ -n "${DEBUG-}" ]]; then
@@ -17,11 +16,11 @@ bash-tokenizer::token() {
     fi
 
     ((BASH_TOKENIZER__POS+=${#chunk}))
-    noNewlines=${chunk//$cr}
+    noNewlines=${chunk//$'\n'}
 
     if [[ "${#noNewlines}" != "${#chunk}" ]]; then
         ((BASH_TOKENIZER__LINE+=${#chunk}-${#noNewlines}))
-        chunk=${chunk##$cr}
+        chunk=${chunk##$'\n'}
         ((BASH_TOKENIZER__CHAR=1+${#chunk}))
     else
         ((BASH_TOKENIZER__CHAR+=${#chunk}))
@@ -32,81 +31,69 @@ bash-tokenizer::shebang() {
     local chunk
 
     if [[ ${BASH_TOKENIZER__CONTENT:0:2} == "#!" ]]; then
-        chunk="${BASH_TOKENIZER__CONTENT%%$cr*}$cr"
+        chunk="${BASH_TOKENIZER__CONTENT/$'\n'*}"$'\n'
         bash-tokenizer::token SHEBANG "$chunk"
     fi
 }
 
 bash-tokenizer::comment() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
     bash-tokenizer::token COMMENT "$line"
 }
 
 bash-tokenizer::word() {
-    local pos word
+    local content
 
-    pos=0
+    content=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
 
-    while true; do
-        case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}" in
-            "" | $'\n' | " " | $'\t' | '(' | ')' | '{' | '}' | '[' | ']' | '$' | '"' | "'" | "|" | "%")
-                word="${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos}"
+    # This is used to speed up the next replacement
+    content=${content/$'\n'*}
 
-                if ! bash-tokenizer::contextFlagExists VAR && [[ "$word" == *% ]]; then
-                    # Include this as part of the word if not parsing a variable
-                    ((pos+=1))
-                elif [[ -n "$word" ]]; then
-                    bash-tokenizer::token WORD "$word"
+    # Include some symbols as part of the word if not parsing a variable
+    if ! bash-tokenizer::contextFlagExists VAR; then
+        # shellcheck disable=SC2036
+        content=${content/[$' \t${}[]()"|'"'"]*}
+    else
+        # shellcheck disable=SC2036
+        content=${content/[$' \t${}[]()"|%'"'"]*}
+    fi
 
-                    return
-                else
-                    bash-tokenizer::token UNKNOWN "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}"
-
-                    return
-                fi
-                ;;
-
-            *)
-                ((pos+=1))
-                ;;
-        esac
-    done
+    if [[ "$content" == *= ]]; then
+        bash-tokenizer::token ASSIGN "$content"
+    elif [[ -n "$content" ]]; then
+        bash-tokenizer::token WORD "$content"
+        bash-tokenizer::contextFlagAdd ARG
+    else
+        bash-tokenizer::token UNKNOWN "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:1}"
+    fi
 }
 
 bash-tokenizer::ws() {
-    local pos
+    local content
 
-    pos=0
+    content=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
 
-    while true; do
-        case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}" in
-            " " | $'\t')
-                ((pos+=1))
-                ;;
-
-            *)
-                bash-tokenizer::token WS "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos}"
-                return
-                ;;
-        esac
-    done
+    # This is to speed up the next replacement
+    content=${content/$'\n'*}
+    content=${content/[^ $'\t']*}
+    bash-tokenizer::token WS "$content"
 }
 
 bash-tokenizer::parenOpen() {
-    local chunk cr line
+    local chunk line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         '('*)
             if [[ "$line" == '('*([[:space:]])')'* ]]; then
-                chunk=${line%%)*}
+                chunk=${line/)*}
                 bash-tokenizer::token EMPTY_LIST "$chunk)"
             else
                 bash-tokenizer::token PAREN_OPEN '('
@@ -117,26 +104,29 @@ bash-tokenizer::parenOpen() {
 }
 
 bash-tokenizer::parenClose() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
-    case "$line" in
-        ')'*)
-            bash-tokenizer::token PAREN_CLOSE ')'
-            bash-tokenizer::contextPop
-            ;;
-    esac
+    if [[ "$line" == "))"* ]] && [[ "${BASH_TOKENIZER__CONTEXT[0]}" == MATH.* ]]; then
+        bash-tokenizer::token MATH_END '))'
+        bash-tokenizer::contextPop
+    elif [[ "${BASH_TOKENIZER__CONTEXT[0]}" == SUBSHELL.* ]]; then
+        bash-tokenizer::token SUBSHELL_END ')'
+        bash-tokenizer::contextPop
+    else
+        bash-tokenizer::token PAREN_CLOSE ')'
+    fi
 }
 
 bash-tokenizer::braceOpen() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         '{'*)
@@ -147,11 +137,11 @@ bash-tokenizer::braceOpen() {
 }
 
 bash-tokenizer::braceClose() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         '}'*)
@@ -162,11 +152,11 @@ bash-tokenizer::braceClose() {
 }
 
 bash-tokenizer::bracketOpen() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         '[['*)
@@ -182,11 +172,11 @@ bash-tokenizer::bracketOpen() {
 }
 
 bash-tokenizer::bracketClose() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         ']]'*)
@@ -202,11 +192,11 @@ bash-tokenizer::bracketClose() {
 }
 
 bash-tokenizer::lessThan() {
-    local cr line
+    local line
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
         "<<"*)
@@ -231,11 +221,10 @@ bash-tokenizer::greaterThan() {
 }
 
 bash-tokenizer::heredocContent() {
-    local content cr delim line tokenNum token
+    local content delim line tokenNum token
 
     tokenNum=${#BASH_TOKENIZER__TOKENS[@]}
     token=
-    cr=$'\n'
 
     while [[ "$token" != REDIR_HEREDOC@* ]]; do
         ((tokenNum-=1))
@@ -253,10 +242,10 @@ bash-tokenizer::heredocContent() {
     content=
     line=
 
-    while [[ "$line" != "$delim$cr" ]]; do
+    while [[ "$line" != "$delim"$'\n' ]]; do
         content+=$line
         line=${BASH_TOKENIZER__CONTENT:$BASH_TOKENIZER__POS + ${#content}}
-        line="${line%%$cr*}$cr"
+        line="${line/$'\n'*}"$'\n'
     done
 
     content+=$line
@@ -270,10 +259,13 @@ bash-tokenizer::ansiEscape() {
     pos=2
 
     while true; do
+        # FIXME: Next line is inefficient
         char=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + pos:1}
 
+        # FIXME: Looping and reading a single character at a time is inefficient
         case "$char" in
             "'" | "")
+                # FIXME: Next line is inefficient
                 bash-tokenizer::token ANSI_ESCAPE "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:pos + 1}"
 
                 return
@@ -296,9 +288,11 @@ bash-tokenizer::stringFragment() {
     len=0
 
     while true; do
+        # FIXME: Next line is inefficient
         case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + len:1}" in
             '"' | "\$" )
                 if [[ "$len" != 0 ]]; then
+                    # FIXME: Next line is inefficient
                     bash-tokenizer::token STR_FRAGMENT "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:len}"
                 fi
 
@@ -327,13 +321,19 @@ bash-tokenizer::stringEnd() {
 }
 
 bash-tokenizer::variable() {
-    local cr line pos
+    local line pos
 
-    cr=$'\n'
+    # FIXME: Next line is inefficient
     line=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS}
-    line=${line%%$cr*}
+    line=${line/$'\n'*}
 
     case "$line" in
+        "\$(("*)
+            bash-tokenizer::token VAR_MATH "\$(("
+            bash-tokenizer::contextPush MATH
+            bash-tokenizer::contextFlagAdd VAR
+            ;;
+
         "\$("*)
             bash-tokenizer::token VAR_SUBSHELL "\$("
             bash-tokenizer::contextPush SUBSHELL
@@ -359,6 +359,7 @@ bash-tokenizer::variable() {
         "\$"*)
             pos=1
 
+            # FIXME: Looping like this is inefficient
             while true; do
                 case "${line:pos:1}" in
                     [[:word:]] | @ | "!")
@@ -380,8 +381,9 @@ bash-tokenizer::variable() {
 bash-tokenizer::stringLiteral() {
     local content
 
+    # FIXME: Next line is inefficient
     content=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS + 1}
-    content=${content%%"'"*}
+    content=${content/"'"*}
     bash-tokenizer::token STR_LITERAL "'$content'"
 }
 
@@ -420,10 +422,10 @@ bash-tokenizer::percent() {
 
 bash-tokenizer::commandDefault() {
     bash-tokenizer::word
-    bash-tokenizer::contextFlagAdd ARG
 }
 
 bash-tokenizer::tokenizeString() {
+    # FIXME: Next line is inefficient
     case "${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:1}" in
         '"')
             bash-tokenizer::stringEnd
@@ -442,11 +444,12 @@ bash-tokenizer::tokenizeString() {
 bash-tokenizer::tokenizeCommand() {
     local char
 
+    # FIXME: Next line is inefficient
     char=${BASH_TOKENIZER__CONTENT:BASH_TOKENIZER__POS:1}
 
     case "$char" in
         "" | $'\n')
-            bash-tokenizer::token EOL "$cr"
+            bash-tokenizer::token EOL $'\n'
             bash-tokenizer::contextFlagRemove ARG
 
             if bash-tokenizer::contextFlagExists DOC; then
@@ -517,7 +520,7 @@ bash-tokenizer::tokenizeCommand() {
 }
 
 bash-tokenizer::tokenize() {
-    local cr
+    local contentLength
 
     BASH_TOKENIZER__CONTENT=$2
     BASH_TOKENIZER__LINE=1
@@ -525,12 +528,12 @@ bash-tokenizer::tokenize() {
     BASH_TOKENIZER__POS=0
     BASH_TOKENIZER__CONTEXT=()
     BASH_TOKENIZER__TOKENS=()
-    cr=$'\n'
+    contentLength=${#2}
 
     bash-tokenizer::contextPush SOURCE
     bash-tokenizer::shebang
 
-    while [[ "$BASH_TOKENIZER__POS" -lt "${#BASH_TOKENIZER__CONTENT}" ]]; do
+    while [[ "$BASH_TOKENIZER__POS" -lt "$contentLength" ]]; do
         if bash-tokenizer::contextFlagExists STR; then
             bash-tokenizer::tokenizeString
         else

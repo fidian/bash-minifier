@@ -6,6 +6,27 @@ bpm::include assign
 bpm::include strict
 . lib/bash-tokenizer
 
+# to profile, unset these two and run. (ps4-python)
+# ./bash-minifier SCRIPT 2>&1 | grep '^\+' | ./profile.py
+# PS4='+$? (${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): } $BASH_COMMAND\n -> '
+# set -x
+
+# Yet another method (debug trap) with only Bash 5
+# PROFILE=true ./bash-minifier SCRIPT 2>&1 | ./profile-bash-5
+if [[ -n "$PROFILE" ]]; then
+    set -o functrace
+
+    if [[ -n "$EPOCHREALTIME" ]]; then
+        trap 'echo "+$? $EPOCHREALTIME (${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): } $BASH_COMMAND" >&2' DEBUG
+    elif [[ "$(date +%N)" == N ]]; then
+        # BSD version of date
+        trap 'echo "+$? $(python -c '"'"'from time import time; print "%.9f" % time();'"'"') (${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): } $BASH_COMMAND" >&2' DEBUG
+    else
+        # GNU version of date
+        trap 'echo "+$? $(date +%s.%N) (${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): } $BASH_COMMAND" >&2' DEBUG
+    fi
+fi
+
 bash-minifier::help() {
     cat <<'EOF'
 Bash Minifier
