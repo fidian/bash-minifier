@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+start=""
+before=""
+lineCount=0
+while read -r line; do
+    if [[ "$line" == "+"* ]]; then
+        now=${line#* }
+        now=${now%% *}
+        now=${now/.}
+
+        if [[ -z "$start" ]]; then
+            start=$now
+            before=$now
+        fi
+
+        elapsed=$((now - before))
+        total=$((now - start))
+
+        elapsed="00000$elapsed"
+        elapsed="${elapsed:0:-6}.${elapsed: -6}"
+        elapsed=${elapsed#0}
+        elapsed=${elapsed#0}
+        elapsed=${elapsed#0}
+        elapsed=${elapsed#0}
+        elapsed=${elapsed#0}
+        elapsed=${elapsed/#./0.}
+
+        total="00000$total"
+        total="${total:0:-6}.${total: -6}"
+        total=${total#0}
+        total=${total#0}
+        total=${total#0}
+        total=${total#0}
+        total=${total#0}
+        total=${total/#./0.}
+        lineCount=$((lineCount + 1))
+
+        echo "$total $elapsed $lineCount ${line%% *} ${line#* * }"
+        before=$now
+    fi
+done
